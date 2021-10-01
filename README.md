@@ -17,7 +17,7 @@ Updates include:
  * Windows 7 or newer
  * Unity 2017.4.X (last developed version, project can be updated)
  * Kinect 2
- * Kinect for Windows SDK (https://www.microsoft.com/en-au/download/details.aspx?id=44561)
+ * Kinect for Windows SDK (available [here](https://www.microsoft.com/en-au/download/details.aspx?id=44561))
 
 ## Licence
 GNU General Public License v3.0 or later
