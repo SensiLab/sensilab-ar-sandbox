@@ -20,7 +20,7 @@ Updates include:
  * Kinect 2
  * Kinect for Windows SDK (available [here](https://www.microsoft.com/en-au/download/details.aspx?id=44561))
 
-## Licence
+## License
 GNU General Public License v3.0 or later
 
 See [COPYING](COPYING) to see the full text
