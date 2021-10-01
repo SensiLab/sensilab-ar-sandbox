@@ -1,0 +1,189 @@
+﻿//  
+//  This file is part of sensilab-ar-sandbox.
+//
+//  sensilab-ar-sandbox is free software: you can redistribute it and/or modify
+//  it under the terms of the GNU General Public License as published by
+//  the Free Software Foundation, either version 3 of the License, or
+//  (at your option) any later version.
+// 
+//  sensilab-ar-sandbox is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//  GNU General Public License for more details.
+// 
+//  You should have received a copy of the GNU General Public License
+//  along with sensilab-ar-sandbox.  If not, see <https://www.gnu.org/licenses/>.
+//
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CS_FillRT
+#pragma kernel CS_StepWaterSim
+#pragma kernel CS_AddNoise
+#pragma kernel CS_DisplaceWater
+
+// Helper functions
+// Random functions found at: http://www.reedbeta.com/blog/quick-and-easy-gpu-random-numbers-in-d3d11/
+uint rand_xorshift(uint rng_state)
+{
+    // Xorshift algorithm from George Marsaglia's paper
+    rng_state ^= (rng_state << 13);
+    rng_state ^= (rng_state >> 17);
+    rng_state ^= (rng_state << 5);
+    return rng_state;
+}
+
+uint wang_hash(uint seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+
+// Step Water Simulation compute shader
+// Inputs
+int3 WaterIntParams = int3(128, 128, 0);
+float2 WaterSimParams = float2(0.1, 0.99);
+
+#define TEX_SIZE_X		(WaterIntParams.x) 
+#define TEX_SIZE_Y		(WaterIntParams.y)
+#define WRAP_AROUND		(WaterIntParams.z)
+
+#define ALPHA			(WaterSimParams.x)
+#define DAMPING_CONST	(WaterSimParams.y)
+
+// Outputs
+RWTexture2D<float> WaterBufferPrev;
+RWTexture2D<float> WaterBufferCurr;
+
+// Shader
+[numthreads(16,16,1)]
+void CS_StepWaterSim(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x < uint(TEX_SIZE_X) && id.y < uint(TEX_SIZE_Y)) {
+		float currentHeight = WaterBufferCurr[id.xy];
+		float prevHeight = WaterBufferPrev[id.xy];
+
+		float leftHeight, rightHeight, bottomHeight, topHeight;
+
+		if (WRAP_AROUND) {
+			leftHeight  = int(id.x) - 1 >= 0 ? WaterBufferCurr[id.xy + uint2(-1, 0)] : WaterBufferCurr[uint2(TEX_SIZE_X - 1, id.y)];
+			rightHeight = id.x + 1 < uint(TEX_SIZE_X) ? WaterBufferCurr[id.xy + uint2(1, 0)] : WaterBufferCurr[uint2(0, id.y)];
+
+			bottomHeight = int(id.y) - 1 >= 0 ? WaterBufferCurr[id.xy + uint2(0, -1)] : WaterBufferCurr[uint2(id.x, TEX_SIZE_Y - 1)];
+			topHeight    = id.y + 1 < uint(TEX_SIZE_Y) ? WaterBufferCurr[id.xy + uint2(0, 1)] : WaterBufferCurr[uint2(id.x, 0)];;
+		} else {
+			leftHeight  = int(id.x) - 1 >= 0 ? WaterBufferCurr[id.xy + uint2(-1, 0)] : 0.5;
+			rightHeight = id.x + 1 < uint(TEX_SIZE_X) ? WaterBufferCurr[id.xy + uint2(1, 0)] : 0.5;
+
+			bottomHeight = int(id.y) - 1 >= 0 ? WaterBufferCurr[id.xy + uint2(0, -1)] : 0.5;
+			topHeight    = id.y + 1 < uint(TEX_SIZE_Y) ? WaterBufferCurr[id.xy + uint2(0, 1)] : 0.5;
+		}
+
+		// Shift all heights to centre around 0, instead of 0.5
+		currentHeight = currentHeight - 0.5;
+		prevHeight = prevHeight - 0.5;
+		leftHeight = leftHeight - 0.5;
+		rightHeight = rightHeight - 0.5;
+		bottomHeight = bottomHeight - 0.5;
+		topHeight = topHeight - 0.5;
+
+		float newHeight = float(DAMPING_CONST) * (2 * currentHeight - prevHeight) 
+							+ float(ALPHA) * (leftHeight - 2 * currentHeight + rightHeight)
+							+ float(ALPHA) * (topHeight - 2 * currentHeight + bottomHeight);
+
+		WaterBufferPrev[id.xy] = newHeight + 0.5;
+	} 
+}
+// Fill Rendertexture compute shader
+// Inputs
+float FillValue;
+
+// Outputs
+RWTexture2D<float> BufferRT;
+
+// Shader
+[numthreads(16,16,1)]
+void CS_FillRT (uint3 id : SV_DispatchThreadID)
+{
+	BufferRT[id.xy] = FillValue;
+}
+
+// Add Noise compute shader
+
+// Inputs
+float Seed;
+
+// Outputs
+RWTexture2D<float> NoiseRT0;
+RWTexture2D<float> NoiseRT1;
+
+// Shader
+[numthreads(16,16,1)]
+void CS_AddNoise (uint3 id : SV_DispatchThreadID)
+{
+	// Seed the PRNG using the thread ID
+    uint rng_state = wang_hash(id.x + Seed * 1000000 + id.y * 10000);
+
+    // Generate a random float in [0, 1)...
+    float randomFloat =  -0.01 + float(rand_xorshift(rng_state)) * (0.02 / 4294967296.0);
+	float oldValue0 = NoiseRT0[id.xy];
+	float oldValue1 = NoiseRT1[id.xy];
+
+	NoiseRT0[id.xy] = oldValue0 + randomFloat;
+	NoiseRT1[id.xy] = oldValue1 + randomFloat;
+}
+
+// Water Displacement shader
+
+// Inputs
+float4 WaterDisplacementPoints0 = float4(10, 10, 20, 20);
+float4 WaterDisplacementPoints1 = float4(30, 30, 40, 40);
+float4 WaterDisplacementRadii = float4(5, 5, 5, 5);
+float4 WaterDisplacementPower = float4(0.5, 0.5, 0.5, 0.5);
+
+int TotalDisplacements = 4;
+
+// Outputs
+RWTexture2D<float> WaterBufferRT0;
+RWTexture2D<float> WaterBufferRT1;
+
+// Shader
+[numthreads(16,16,1)]
+void CS_DisplaceWater (uint3 id : SV_DispatchThreadID)
+{
+	float xDelta0 = id.x - WaterDisplacementPoints0.x;
+	float yDelta0 = id.y - WaterDisplacementPoints0.y;
+	float dist0 = sqrt(xDelta0*xDelta0 + yDelta0*yDelta0);
+	float distClamp0 = clamp(dist0/(float)WaterDisplacementRadii.x, 0, 1);
+	float displacement0 = WaterDisplacementPower.x * (1 - distClamp0);
+
+	float xDelta1 = id.x - WaterDisplacementPoints0.z;
+	float yDelta1 = id.y - WaterDisplacementPoints0.w;
+	float dist1 = sqrt(xDelta1*xDelta1 + yDelta1*yDelta1);
+	float distClamp1 = clamp(dist1/WaterDisplacementRadii.y, 0, 1);
+	float displacement1 = WaterDisplacementPower.y * (1 - distClamp1);
+
+	float xDelta2 = id.x - WaterDisplacementPoints1.x;
+	float yDelta2 = id.y - WaterDisplacementPoints1.y;
+	float dist2 = sqrt(xDelta2*xDelta2 + yDelta2*yDelta2);
+	float distClamp2 = clamp(dist2/WaterDisplacementRadii.z, 0, 1);
+	float displacement2 = WaterDisplacementPower.z * (1 - distClamp2);
+
+	float xDelta3 = id.x - WaterDisplacementPoints1.z;
+	float yDelta3 = id.y - WaterDisplacementPoints1.w;
+	float dist3 = sqrt(xDelta3*xDelta3 + yDelta3*yDelta3);
+	float distClamp3 = clamp(dist3/WaterDisplacementRadii.w, 0, 1);
+	float displacement3 = WaterDisplacementPower.w * (1 - distClamp3);
+
+	float finalDisplacement = displacement0;
+	finalDisplacement = TotalDisplacements > 1 ? finalDisplacement + displacement1 : finalDisplacement;
+	finalDisplacement = TotalDisplacements > 2 ? finalDisplacement + displacement2 : finalDisplacement;
+	finalDisplacement = TotalDisplacements > 3 ? finalDisplacement + displacement3 : finalDisplacement;
+
+	WaterBufferRT0[id.xy] = WaterBufferRT0[id.xy] + clamp(finalDisplacement, -1, 1);
+	WaterBufferRT1[id.xy] = WaterBufferRT1[id.xy] + clamp(finalDisplacement, -1, 1);
+}
+

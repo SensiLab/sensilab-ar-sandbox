@@ -1,0 +1,507 @@
+﻿//  
+//  This file is part of sensilab-ar-sandbox.
+//
+//  sensilab-ar-sandbox is free software: you can redistribute it and/or modify
+//  it under the terms of the GNU General Public License as published by
+//  the Free Software Foundation, either version 3 of the License, or
+//  (at your option) any later version.
+// 
+//  sensilab-ar-sandbox is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//  GNU General Public License for more details.
+// 
+//  You should have received a copy of the GNU General Public License
+//  along with sensilab-ar-sandbox.  If not, see <https://www.gnu.org/licenses/>.
+//
+
+#pragma kernel CS_LowPassData
+#pragma kernel CS_SetInitialLowPassData
+#pragma kernel CS_DownsampleRT
+#pragma kernel CS_GaussianBlurHorizontal
+#pragma kernel CS_GaussianBlurVertical
+#pragma kernel CS_GeneratePlaneMesh
+#pragma kernel CS_GeneratePlaneMeshNoTris
+#pragma kernel CS_ContourSobelFilter
+#pragma kernel CS_ContourNonMaximalSupression
+#pragma kernel CS_ContourFindPaths
+#pragma kernel CS_ExtractDepthData
+
+#define POW_2_16 65535.0
+#define pi 3.141592653
+
+// Data low pass compute shader
+// Inputs (sampler for downsample too)
+Texture2D RawDataRT;
+// This sampler actually works!
+SamplerState linearClampSampler;
+
+RWTexture2D<float> InternalLowPassDataRT;
+RWTexture2D<float> LowPassCounterRT;
+
+float4 LowPassParams0 = float4(512, 424, 0.3, 0.05);
+float4 LowPassParams1 = float4(1000.0, 1200.0, 10.0, 20.0);
+
+#define TEX_SIZE_LP_X		(LowPassParams0.x) 
+#define TEX_SIZE_LP_Y		(LowPassParams0.y)
+#define ALPHA_1			(LowPassParams0.z)
+#define ALPHA_2			(LowPassParams0.w)
+
+#define MIN_DEPTH	    (LowPassParams1.x)
+#define MAX_DEPTH		(LowPassParams1.y)
+#define NOISE_TOLERANCE (LowPassParams1.z)
+#define HOLD_TIME		(LowPassParams1.w)
+
+// Outputs
+RWTexture2D<float> LowPassDataRT;
+
+[numthreads(16,16,1)]
+void CS_LowPassData (uint3 id : SV_DispatchThreadID)
+{
+	float sizeX = float(TEX_SIZE_LP_X);
+	float sizeY = float(TEX_SIZE_LP_Y);
+
+	float2 texCoord = float2(id.x / sizeX, id.y / sizeY);
+	float depthVal = (float)RawDataRT.SampleLevel(linearClampSampler, texCoord, 0);
+
+	float depthRange = MAX_DEPTH - MIN_DEPTH;
+	float adjustedMinDepth = MIN_DEPTH - depthRange * 0.2;
+	float adjustedMaxDepth = MAX_DEPTH + depthRange * 0.2;
+	float scaledDepthVal = depthVal * POW_2_16;
+
+	float internalDepthValue = InternalLowPassDataRT[id.xy];
+	if (scaledDepthVal < adjustedMinDepth  || scaledDepthVal > adjustedMaxDepth) depthVal = internalDepthValue;
+
+	if (depthVal > internalDepthValue) {
+		internalDepthValue = ALPHA_1*depthVal  + (1-ALPHA_1)*internalDepthValue;
+	} else {
+		internalDepthValue = ALPHA_2*depthVal  + (1-ALPHA_2)*internalDepthValue;
+	}
+	InternalLowPassDataRT[id.xy] = internalDepthValue;
+
+	float visibleDepthValue = LowPassDataRT[id.xy];
+
+	if (abs(visibleDepthValue - internalDepthValue) > NOISE_TOLERANCE / POW_2_16) {
+		LowPassCounterRT[id.xy] += 1;
+		if (LowPassCounterRT[id.xy] > HOLD_TIME + 1) {
+			LowPassDataRT[id.xy] = clamp(internalDepthValue, MIN_DEPTH / POW_2_16, MAX_DEPTH / POW_2_16);
+		}
+	} else {
+		LowPassCounterRT[id.xy] = 0;
+	}
+}
+
+[numthreads(16,16,1)]
+void CS_SetInitialLowPassData (uint3 id : SV_DispatchThreadID)
+{
+	float sizeX = float(TEX_SIZE_LP_X);
+	float sizeY = float(TEX_SIZE_LP_Y);
+
+	float2 texCoord = float2(id.x / sizeX, id.y / sizeY);
+
+	float depthVal = (float)RawDataRT.SampleLevel(linearClampSampler, texCoord, 0);
+	float depthRange = MAX_DEPTH - MIN_DEPTH;
+
+	depthVal = clamp(depthVal, (MIN_DEPTH) / POW_2_16, (MAX_DEPTH) / POW_2_16);
+
+	InternalLowPassDataRT[id.xy] = depthVal;
+	LowPassDataRT[id.xy] = depthVal;
+	LowPassCounterRT[id.xy] = 0;
+}
+
+// Downsample compute shader
+
+// Outputs
+RWTexture2D<float> DownsampledDataRT;
+
+// Extra inputs for texture downsampler
+uint4 DownsampleParams = uint4(512, 424, 512, 424);
+#define TEX_SIZE_ORIG_X		(DownsampleParams.x) 
+#define TEX_SIZE_ORIG_Y		(DownsampleParams.y)
+#define TEX_SIZE_DS_X		(DownsampleParams.z) 
+#define TEX_SIZE_DS_Y		(DownsampleParams.w)
+
+// TODO: Fix this mess.
+[numthreads(16,16,1)]
+void CS_DownsampleRT (uint3 id : SV_DispatchThreadID)
+{
+	float sizeX = float(TEX_SIZE_ORIG_X);
+	float sizeY = float(TEX_SIZE_ORIG_Y);
+	float f_x = (float)id.x;
+	float f_y = (float)id.y;
+
+	if (id.x < TEX_SIZE_DS_X - 1 && id.y < TEX_SIZE_DS_Y - 1) {
+		float2 texCoord0 = float2(2*f_x / sizeX, 2*f_y / sizeY);
+		float2 texCoord1 = float2((2*f_x + 1) / sizeX, 2*f_y / sizeY);
+		float2 texCoord2 = float2(2*f_x / sizeX, (2*f_y + 1) / sizeY);
+		float2 texCoord3 = float2((2*f_x + 1) / sizeX, (2*f_y + 1) / sizeY);
+
+		float texVal0 = (float)RawDataRT.SampleLevel(linearClampSampler, texCoord0, 0);
+		float texVal1 = (float)RawDataRT.SampleLevel(linearClampSampler, texCoord1, 0);
+		float texVal2 = (float)RawDataRT.SampleLevel(linearClampSampler, texCoord2, 0);
+		float texVal3 = (float)RawDataRT.SampleLevel(linearClampSampler, texCoord3, 0);
+
+		float DownsampledValue = (texVal0+texVal1+texVal2+texVal3) / 4.0;
+		DownsampledDataRT[id.xy] = DownsampledValue;
+	} else {
+		float2 texCoordMax = float2((2*f_x + 1) / sizeX, (2*f_y + 1) / sizeY);
+		DownsampledDataRT[id.xy] = (float)RawDataRT.SampleLevel(linearClampSampler, texCoordMax, 0);
+	}
+}
+
+// Gaussian Blur shader
+Texture2D<float> UnblurredDataRT;
+RWTexture2D<float> BlurredDataRT;
+float2 BlurTextureSize;
+
+//0.008488	0.038078	0.111165	0.211357	0.261824	0.211357	0.111165	0.038078	0.008488
+[numthreads(16,16,1)]
+void CS_GaussianBlurHorizontal (uint3 id : SV_DispatchThreadID)
+{
+	int id_x = (int)id.x;
+	int id_y = (int)id.y;
+
+	// Could possibly use a sampler here instead of clamping.
+	int id_x_0 = clamp(id_x - 4, 0, 10000);
+	int id_x_1 = clamp(id_x - 3, 0, 10000);
+	int id_x_2 = clamp(id_x - 2, 0, 10000);
+	int id_x_3 = clamp(id_x - 1, 0, 10000);
+
+	int id_x_5 = clamp(id_x + 1, 0, BlurTextureSize.x - 1);
+	int id_x_6 = clamp(id_x + 2, 0, BlurTextureSize.x - 1);
+	int id_x_7 = clamp(id_x + 3, 0, BlurTextureSize.x - 1);
+	int id_x_8 = clamp(id_x + 4, 0, BlurTextureSize.x - 1);
+
+	float texVal0 = UnblurredDataRT[float2(id_x_0, id_y)] * 0.008488;
+	float texVal1 = UnblurredDataRT[float2(id_x_1, id_y)] * 0.038078;
+	float texVal2 = UnblurredDataRT[float2(id_x_2, id_y)] * 0.111165;
+	float texVal3 = UnblurredDataRT[float2(id_x_3, id_y)] * 0.211357;
+	float texVal4 = UnblurredDataRT[float2(id_x,   id_y)] * 0.261824;
+	float texVal5 = UnblurredDataRT[float2(id_x_5, id_y)] * 0.211357;
+	float texVal6 = UnblurredDataRT[float2(id_x_6, id_y)] * 0.111165;
+	float texVal7 = UnblurredDataRT[float2(id_x_7, id_y)] * 0.038078;
+	float texVal8 = UnblurredDataRT[float2(id_x_8, id_y)] * 0.008488;
+
+	float total = texVal0 + texVal1 + texVal2 + texVal3 + texVal4 + texVal5 + texVal6 + texVal7 + texVal8;
+
+	BlurredDataRT[id.xy] = total;
+}
+
+[numthreads(16,16,1)]
+void CS_GaussianBlurVertical (uint3 id : SV_DispatchThreadID)
+{
+	int id_x = (int)id.x;
+	int id_y = (int)id.y;
+
+	int id_y_0 = clamp(id_y - 4, 0, 10000);
+	int id_y_1 = clamp(id_y - 3, 0, 10000);
+	int id_y_2 = clamp(id_y - 2, 0, 10000);
+	int id_y_3 = clamp(id_y - 1, 0, 10000);
+
+	int id_y_5 = clamp(id_y + 1, 0, BlurTextureSize.y - 1);
+	int id_y_6 = clamp(id_y + 2, 0, BlurTextureSize.y - 1);
+	int id_y_7 = clamp(id_y + 3, 0, BlurTextureSize.y - 1);
+	int id_y_8 = clamp(id_y + 4, 0, BlurTextureSize.y - 1);
+
+	float texVal0 = UnblurredDataRT[float2(id_x, id_y_0)] * 0.008488;
+	float texVal1 = UnblurredDataRT[float2(id_x, id_y_1)] * 0.038078;
+	float texVal2 = UnblurredDataRT[float2(id_x, id_y_2)] * 0.111165;
+	float texVal3 = UnblurredDataRT[float2(id_x, id_y_3)] * 0.211357;
+	float texVal4 = UnblurredDataRT[float2(id_x, id_y)] * 0.261824;
+	float texVal5 = UnblurredDataRT[float2(id_x, id_y_5)] * 0.211357;
+	float texVal6 = UnblurredDataRT[float2(id_x, id_y_6)] * 0.111165;
+	float texVal7 = UnblurredDataRT[float2(id_x, id_y_7)] * 0.038078;
+	float texVal8 = UnblurredDataRT[float2(id_x, id_y_8)] * 0.008488;
+
+	float total = texVal0 + texVal1 + texVal2 + texVal3 + texVal4 + texVal5 + texVal6 + texVal7 + texVal8;
+
+	BlurredDataRT[id.xy] = total;
+}
+// Generate Mesh compute shader
+// Inputs
+Texture2D<float> DataToMeshRT;
+
+float3 MeshWorldPos;
+float3 MeshParams;
+#define ZScaleFactor  (MeshParams.x)
+#define MeshWidth	  (MeshParams.y)
+#define MeshHeight	  (MeshParams.z)
+float2 MeshStride;
+
+// Outputs
+RWStructuredBuffer<float3> PlaneMeshVert;
+RWStructuredBuffer<float2> PlaneMeshUV;
+RWStructuredBuffer<int> PlaneMeshTriangles;
+
+float3 GetPlanePosition(uint2 meshPos) {
+	float xPos = float(meshPos.x) * MeshStride.x;
+	float yPos = float(meshPos.y) * MeshStride.y;
+	float depthVal = DataToMeshRT[meshPos.xy];
+
+	float zPos = depthVal * POW_2_16; 
+	zPos = zPos * ZScaleFactor;
+
+	return MeshWorldPos + float3(xPos, yPos, zPos);
+}
+
+// Shader
+[numthreads(16,16,1)] 
+void CS_GeneratePlaneMesh(uint3 id : SV_DispatchThreadID) {
+	if (id.x < uint(MeshWidth) && id.y < uint(MeshHeight)) {
+		int vertexIndex = id.y * MeshWidth + id.x;
+
+		// Vertex Position
+		PlaneMeshVert[vertexIndex] = GetPlanePosition(id.xy);
+
+		// UV Coordinates
+		PlaneMeshUV[vertexIndex] = float2(id.x / float(MeshWidth), id.y / float(MeshHeight));
+
+		if (id.x < uint(MeshWidth - 1) && id.y < uint(MeshHeight - 1)) {
+			// Triangle Indices
+			int triIndex = id.y * (MeshWidth - 1) + id.x;
+			int tri00 = vertexIndex;
+			int tri10 = tri00 + 1;
+			int tri01 = tri00 + MeshWidth;
+			int tri11 = tri01 + 1;
+
+			PlaneMeshTriangles[triIndex*6] = tri01;
+			PlaneMeshTriangles[triIndex*6+1] = tri10;
+			PlaneMeshTriangles[triIndex*6+2] = tri00;
+			PlaneMeshTriangles[triIndex*6+3] = tri11;
+			PlaneMeshTriangles[triIndex*6+4] = tri10;
+			PlaneMeshTriangles[triIndex*6+5] = tri01;
+		}
+	}
+}
+
+//Shader
+[numthreads(16,16,1)]
+void CS_GeneratePlaneMeshNoTris(uint3 id : SV_DispatchThreadID) {
+	if (id.x < uint(MeshWidth) && id.y < uint(MeshHeight)) {
+		int vertexIndex = id.y * MeshWidth + id.x;
+		// Vertex Position
+		PlaneMeshVert[vertexIndex] = GetPlanePosition(id.xy);
+		// UV Coordinates
+		PlaneMeshUV[vertexIndex] = float2(id.x / float(MeshWidth), id.y / float(MeshHeight));
+	}
+}
+
+// Extract depth data
+// Inputs
+Texture2D<float> ExtractDataRT;
+int2 ExtractDataSize;
+
+// Outputs
+RWStructuredBuffer<int> ExtractBuffer;
+
+//Shader
+[numthreads(16,16,1)]
+void CS_ExtractDepthData(uint3 id : SV_DispatchThreadID) {
+	if (id.x < uint(ExtractDataSize.x) && id.y < uint(ExtractDataSize.y)) {
+		uint bufferIndex = id.x + id.y * ExtractDataSize.x;
+		float extractDataValue = (float)ExtractDataRT[id.xy] * POW_2_16;
+		
+		ExtractBuffer[bufferIndex] = (int) extractDataValue;
+	}
+}
+
+int2 ContourTextureSize;
+Texture2D<float4> ContourRT;
+RWTexture2D<float4> SobelRT;
+
+float GetContourValue(int2 id) {
+	int id_x = clamp(id.x, 0, ContourTextureSize.x - 1);
+	int id_y = clamp(id.y, 0, ContourTextureSize.y - 1);
+
+	return ContourRT[int2(id_x, id_y)].x;
+}
+
+[numthreads(16,16,1)]
+void CS_ContourSobelFilter(uint3 id : SV_DispatchThreadID) {
+	int2 id_int = int2((int)id.x, (int)id.y);
+	float offsetContourLevel = ContourRT[id.xy].y;
+
+	float contourValue00 = GetContourValue(id_int + int2(-1, -1));
+	float contourValue01 = GetContourValue(id_int + int2(-1, 0));
+	float contourValue02 = GetContourValue(id_int + int2(-1, 1));
+	float contourValue10 = GetContourValue(id_int + int2(0, -1));
+	float contourValue12 = GetContourValue(id_int + int2(0, 1));
+	float contourValue20 = GetContourValue(id_int + int2(1, -1));
+	float contourValue21 = GetContourValue(id_int + int2(1, 0));
+	float contourValue22 = GetContourValue(id_int + int2(1, 1));
+
+	float sobelHorizontal = contourValue00 + 2 * contourValue01 + contourValue02
+						  - contourValue20 - 2 * contourValue21 - contourValue22;
+
+	float sobelVertical = contourValue00 + 2 * contourValue10 + contourValue20
+						- contourValue02 - 2 * contourValue12 - contourValue22;
+
+	float gradientMagnitude = sqrt(sobelHorizontal*sobelHorizontal + sobelVertical*sobelVertical) / 8.0;
+	float gradientAngle = atan2(sobelVertical, sobelHorizontal);
+	
+	//atan2 range is [-pi, pi], need to offset it to normalise the angle.
+	gradientAngle = (gradientAngle + pi) / (2 * pi);
+
+	SobelRT[id_int] = float4(gradientAngle, gradientMagnitude, offsetContourLevel, 1);
+}
+
+Texture2D<float4> SobelInputRT;
+RWTexture2D<float4> MaximalContourRT;
+
+float4 GetSobelContourValue(int2 id) {
+	int id_x = clamp(id.x, 0, ContourTextureSize.x - 1);
+	int id_y = clamp(id.y, 0, ContourTextureSize.y - 1);
+
+	return SobelInputRT[int2(id_x, id_y)];
+}
+
+[numthreads(16,16,1)]
+void CS_ContourNonMaximalSupression(uint3 id : SV_DispatchThreadID) {
+	static float2 gridDirections[8] =
+	{
+		int2(1, 0),
+		int2(1, 1),
+		int2(0, 1),
+		int2(-1, 1),
+		int2(-1, 0),
+		int2(-1, -1),
+		int2(0, -1),
+		int2(1, -1)
+	};	
+	static float4 gridDirColours[8] =
+	{
+		float4(1, 0, 0, 1),
+		float4(1, 1, 0, 1),
+		float4(0, 1, 0, 1),
+		float4(0, 1, 1, 1),
+		float4(0, 0, 1, 1),
+		float4(1, 0, 1, 1),
+		float4(1, 0.5, 0, 1),
+		float4(0, 0.5, 0.5, 1)
+	};
+	int2 id_int = int2((int)id.x, (int)id.y);
+	
+	float4 contourValue = SobelInputRT[id.xy];
+
+	float invertAngle = (uint)(contourValue.z * 255.0) % 2;
+	float newAngle = contourValue.x + 0.5 * invertAngle;
+	newAngle = newAngle > 1 ? newAngle - 1 : newAngle;
+
+	float contourAngle = newAngle * 360.0;
+	contourAngle += contourAngle > 360.0 ? -360 : 0;
+
+if (contourValue.y > 0.35) {
+		int indexStart = floor((contourAngle + 22.5) / 45.0);
+
+		int index0 = indexStart > 7 ? 7 : indexStart;
+		int index1 = indexStart + 4 > 7 ? indexStart + 4 - 8 : indexStart + 4;
+
+		int2 texCoord0 = id_int + gridDirections[index0];
+		int2 texCoord1 = id_int + gridDirections[index1];
+
+		float4 contourValue0 = GetSobelContourValue(texCoord0);
+		float4 contourValue1 = GetSobelContourValue(texCoord1);
+		
+		float4 contourVal = float4(newAngle, 1, contourValue.z, 1);
+		float4 finalColour = contourValue.y > contourValue0.y ? contourVal : float4(0, 0, 0, 1);
+		finalColour = contourValue.y > contourValue1.y ? contourVal : float4(0, 0, 0, 1);
+
+		MaximalContourRT[id_int] = finalColour;
+	} else {
+		MaximalContourRT[id_int] = float4(0, 0, contourValue.z, 1);
+	}	
+}
+
+
+Texture2D<float4> MaximalContourInputRT;
+RWStructuredBuffer<int> ContourPathsBuffer;
+
+float4 GetMaximialContourValue(int2 id) {
+	int id_x = clamp(id.x, 0, ContourTextureSize.x - 1);
+	int id_y = clamp(id.y, 0, ContourTextureSize.y - 1);
+
+	return MaximalContourInputRT[int2(id_x, id_y)];
+}
+
+[numthreads(16,16,1)]
+void CS_ContourFindPaths(uint3 id : SV_DispatchThreadID) {
+	static float2 gridDirections[8] =
+	{
+		int2(1, 0),
+		int2(1, 1),
+		int2(0, 1),
+		int2(-1, 1),
+		int2(-1, 0),
+		int2(-1, -1),
+		int2(0, -1),
+		int2(1, -1)
+	};	
+	static float4 gridDirColours[8] =
+	{
+		float4(1, 0, 0, 1),
+		float4(1, 1, 0, 1),
+		float4(0, 1, 0, 1),
+		float4(0, 1, 1, 1),
+		float4(0, 0, 1, 1),
+		float4(1, 0, 1, 1),
+		float4(1, 0.5, 0, 1),
+		float4(0, 0.5, 0.5, 1)
+	};
+	int bufferIndex = (int)id.x + (int)id.y * ContourTextureSize.x;
+
+	int2 id_int = int2((int)id.x, (int)id.y);
+	if(id_int.x < ContourTextureSize.x && id_int.y < ContourTextureSize.y) {
+		float4 contourValue = MaximalContourInputRT[id.xy];
+		float contourAngle = contourValue.x * 360.0 + 90;
+		contourAngle += contourAngle > 360.0 ? -360 : 0;
+	
+		int angle = round(contourValue.x * 255.0);
+		int onContour = contourValue.y;
+		int contourNumber = round(contourValue.z * 255.0);
+
+		// Valid directions 0 - 7.
+		uint direction = 8;
+
+		if (contourValue.y == 1) {
+			int indexStart = floor((contourAngle - 45) / 45.0);
+
+			uint index0 = indexStart < 0 ? 7 : indexStart;
+			uint index1 = indexStart + 1;
+			uint index2 = indexStart + 2 > 7 ? 0 : indexStart + 2;
+		
+			// Shifts the empty pixel errors to vertical / horizontal pixels
+			uint tempIndex1 = index1;
+			index1 = index1 % 2 == 0 ? index2 : index0;
+			index0 = tempIndex1 % 2 == 0 ? index0 : tempIndex1;
+			index2 = tempIndex1 % 2 == 0 ? tempIndex1 : index2;
+
+			int2 texCoord0 = id_int + gridDirections[index0];
+			int2 texCoord1 = id_int + gridDirections[index1];
+			int2 texCoord2 = id_int + gridDirections[index2];
+
+			float4 contourValue0 = GetMaximialContourValue(texCoord0);
+			float4 contourValue1 = GetMaximialContourValue(texCoord1);
+			float4 contourValue2 = GetMaximialContourValue(texCoord2);
+		
+			uint finalDirection = contourValue0.y == 1 ? index0 : 8;
+			finalDirection = contourValue1.y == 1 ? index1 : finalDirection;
+			finalDirection = contourValue2.y == 1 ? index2 : finalDirection;
+
+			if (finalDirection == 8) {
+				uint index3 = indexStart + 3 > 7 ? 0 : indexStart + 3;
+				int2 texCoord3 = id_int + gridDirections[index3];
+				float4 contourValue3 = GetMaximialContourValue(texCoord3);
+
+				finalDirection = contourValue3.y == 1 ? index3 : 8;
+			} 
+			direction = finalDirection;
+		}
+		// Pack data into single int.
+		int contourPathPixel = direction;
+		contourPathPixel += onContour << 4;
+		contourPathPixel += contourNumber << 8;
+		contourPathPixel += angle << 16;
+
+		ContourPathsBuffer[bufferIndex] = contourPathPixel;
+	}
+}

@@ -1,0 +1,327 @@
+﻿//  
+//  This file is part of sensilab-ar-sandbox.
+//
+//  sensilab-ar-sandbox is free software: you can redistribute it and/or modify
+//  it under the terms of the GNU General Public License as published by
+//  the Free Software Foundation, either version 3 of the License, or
+//  (at your option) any later version.
+// 
+//  sensilab-ar-sandbox is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//  GNU General Public License for more details.
+// 
+//  You should have received a copy of the GNU General Public License
+//  along with sensilab-ar-sandbox.  If not, see <https://www.gnu.org/licenses/>.
+//
+
+#pragma kernel CS_ComputeGeologySurface
+//#pragma kernel CS_ComputeGeologySlice
+#pragma kernel CS_RasteriseGeologySurface
+#pragma kernel CS_FillRT
+
+#define PI_2		6.28318530718
+#define POW_2_32	4294967295.0
+#define POW_2_16	65535.0
+
+struct GeologicalTransform
+{
+	int Type;
+	float4x4 Transform;
+	float4x4 InverseTransform;
+	float Amplitude;
+	float Period;
+	float Offset;
+};
+
+struct GeologicalLayer
+{
+	float3 colour;
+	float depth;
+	int textureType;
+};
+
+struct TransformPt 
+{
+	float4 position;
+	// Can store 32 different fault levels ( 2^32 possibilities )
+	int faultNumber;
+	// Can store 32 different fold levels ( 2^32 possibilities )
+	int foldNumber;
+};
+
+Texture2D SandboxDepthsRT;
+SamplerState samplerSandboxDepthsRT
+{
+    Filter = MIN_MAG_MIP_LINEAR;
+    AddressU = Mirror;
+    AddressV = Mirror;
+};
+
+int2 BufferLengths = int2(5, 5);
+#define TRANSFORM_LENGTH	(BufferLengths.x) 
+#define LAYER_LENGTH		(BufferLengths.y)
+
+int4 TextureSizes = int4(128, 128, 256, 256);
+#define INPUT_TEX_X			(TextureSizes.x)
+#define INPUT_TEX_Y			(TextureSizes.y)
+#define OUTPUT_TEX_X		(TextureSizes.z)
+#define OUTPUT_TEX_Y		(TextureSizes.w)
+
+float2 SimulationSize = float2(128, 128);
+#define SIM_SIZE_X		(SimulationSize.x)
+#define SIM_SIZE_Y		(SimulationSize.y)
+
+float LayerStartDepth = 1000;
+
+StructuredBuffer<GeologicalTransform> TransformBuffer;
+StructuredBuffer<GeologicalLayer> LayerBuffer;
+
+RWTexture2D<float4> GeologySurfaceRT;
+
+float BellFunc(float x)
+	{
+		float f = (x / 2.0) * 1.5; // Converting -2 to +2 to -1.5 to +1.5
+		if (f > -1.5 && f < -0.5)
+		{
+			return(0.5 * pow(f + 1.5, 2.0));
+		}
+		else if (f > -0.5 && f < 0.5)
+		{
+			return 3.0 / 4.0 - (f * f);
+		}
+		else if ((f > 0.5 && f < 1.5))
+		{
+			return(0.5 * pow(f - 1.5, 2.0));
+		}
+		return 0.0;
+	}
+
+float BiCubic(float2 uv)
+{
+	float2 uvStep = float2(1.0 / INPUT_TEX_X, 1.0 / INPUT_TEX_Y	);
+	float sum = 0.0;
+	float denom = 0.0;
+	float a = frac(uv.x * INPUT_TEX_X);
+	float b = frac(uv.y * INPUT_TEX_Y);
+
+	float2 texUV = uv - float2(a / INPUT_TEX_X, b / INPUT_TEX_Y	);
+	for (int m = -1; m <= 2; m++)
+	{
+		for (int n = -1; n <= 2; n++)
+		{
+			float2 uvOffset = float2(uvStep.x * float(m), uvStep.y * float(n));
+			float heightVal = (float)SandboxDepthsRT.SampleLevel(samplerSandboxDepthsRT, texUV + uvOffset, 0);
+
+			float f = BellFunc(float(m) - a);
+			float f1 = BellFunc(-(float(n) - b));
+
+			sum = sum + (heightVal * f * f1);
+			denom = denom + (f * f1);
+		}
+	}
+	return sum / denom;
+}
+
+float4 TiltPoint(float4 origPos, GeologicalTransform transform) {
+	float4 transformedPos = mul(transform.InverseTransform, origPos);
+	return transformedPos;
+}
+
+TransformPt FoldPoint(TransformPt transformPt, GeologicalTransform transform, int foldIndex) {
+	float4 transformedPos = mul(transform.Transform, transformPt.position);
+
+	float sinXPosition = (transformedPos.x + transform.Offset - 180) * (float)PI_2 / transform.Period;
+	sinXPosition = (sinXPosition % PI_2);
+	sinXPosition = sinXPosition < 0 ? sinXPosition + PI_2 : sinXPosition;
+
+	int multiplier = floor(sinXPosition / PI_2 * 4.0);
+	transformPt.foldNumber = transformPt.foldNumber + foldIndex * (1 << multiplier);
+
+	transformedPos.z = transformedPos.z + -transform.Amplitude*sin(sinXPosition);
+	transformPt.position = mul(transform.InverseTransform, transformedPos);
+
+	return transformPt;
+}
+
+TransformPt FaultPoint(TransformPt transformPt, GeologicalTransform transform, int faultIndex) {
+	float4 transformedPos = mul(transform.InverseTransform, transformPt.position);
+
+	transformedPos.z = transformedPos.x < transform.Offset ? transformedPos.z + transform.Amplitude : transformedPos.z;
+	transformPt.faultNumber = transformedPos.x < transform.Offset ? transformPt.faultNumber + faultIndex : transformPt.faultNumber;
+
+	transformPt.position = mul(transform.Transform, transformedPos);
+
+	return transformPt;
+}
+
+TransformPt TransformPoint(float4 origPos) {
+	TransformPt transformPt;
+
+	transformPt.position = origPos;
+	transformPt.faultNumber = 0;
+	transformPt.foldNumber = 0;
+
+	int faultIndex = 1;
+	int foldIndex = 1;
+	for (int i = 0; i < TRANSFORM_LENGTH; i++) {
+
+		switch (TransformBuffer[i].Type) {
+			case 0:
+				transformPt.position = TiltPoint(transformPt.position, TransformBuffer[i]);
+				break;
+			case 1:
+				transformPt = FoldPoint(transformPt, TransformBuffer[i], foldIndex);
+				foldIndex *= 16;
+				break;
+			case 2:
+				transformPt = FaultPoint(transformPt, TransformBuffer[i], faultIndex);
+				faultIndex *= 2;
+				break;
+		}
+		
+	}
+	return transformPt;
+}
+
+int GetLayerIndexAtDepth(float depth) {
+	int layerIndex = LAYER_LENGTH - 1;
+	for (int j = LAYER_LENGTH - 1; j >= 0; j--) {
+		if (depth < LayerBuffer[j].depth) {
+			layerIndex = j;
+		}
+	}
+	if (depth < LayerStartDepth) {
+		layerIndex = 254;
+	}
+	return layerIndex;
+}
+
+[numthreads(16,16,1)]
+void CS_ComputeGeologySurface (uint3 id : SV_DispatchThreadID)
+{
+	float sizeX = float(OUTPUT_TEX_X);
+	float sizeY = float(OUTPUT_TEX_Y);
+
+	float2 texCoord = float2((int)id.x / sizeX, (int)id.y / sizeY);
+	float depthVal = BiCubic(texCoord);
+
+	float4 dataPosition = float4(id.x / sizeX * SIM_SIZE_X, id.y / sizeY * SIM_SIZE_Y, -depthVal * POW_2_16, 1);
+	TransformPt transformedPt = TransformPoint(dataPosition);
+	float layerIndex = GetLayerIndexAtDepth(transformedPt.position.z);
+
+	GeologySurfaceRT[id.xy] = float4(layerIndex / 255.0f, transformedPt.faultNumber / POW_2_32, transformedPt.foldNumber / POW_2_32, 1);
+}
+
+float4 SlicePoints = float4(0, 0, 256, 0);
+
+/*[numthreads(16,16,1)]
+void CS_ComputeGeologySlice (uint3 id : SV_DispatchThreadID)
+{
+	float sizeX = float(OUTPUT_TEX_X);
+	float sizeY = float(OUTPUT_TEX_Y);
+
+	float2 delta = SlicePoints.zw - SlicePoints.xy;
+	float xFraction = id.x / sizeX;
+	float2 linePos = SlicePoints.xy + delta * xFraction;
+	float2 texCoord = float2(linePos.x / sizeX, linePos.y / sizeY);
+
+	float depthVal = (float)SandboxDepthsRT.SampleLevel(samplerSandboxDepthsRT, texCoord, 0);
+
+	float4 dataPosition = float4(linePos.x, linePos.y, id.y / sizeY * -256.0, 1);
+
+	float4 transformedPt = TransformPoint(dataPosition);
+
+	GeologySurfaceRT[id.xy] = float4(GetLayerColourAtDepth(transformedPt.z).xyz, 1);
+}*/
+
+uint TotalFaults;
+float FaultLineWidth;
+StructuredBuffer<float4> FaultColourBuffer;
+
+uint TotalFolds;
+float FoldLineWidth;
+StructuredBuffer<float4> FoldColourBuffer;
+
+float LayerLineWidth = 5;
+float3 LayerLineColor = float3(0.2, 0.2, 0.2);
+
+Texture2DArray PatternsTex2DArr;
+SamplerState samplerPatternsTex2DArr
+{
+    Filter = MIN_MAG_MIP_LINEAR;
+    AddressU = Repeat;
+    AddressV = Repeat;
+};
+
+RWTexture2D<float4> ColouredOutputRT;
+
+[numthreads(16,16,1)]
+void CS_RasteriseGeologySurface (uint3 id : SV_DispatchThreadID)
+{
+	float4 surfaceData00 = GeologySurfaceRT[id.xy];
+	uint surfaceIndex = surfaceData00.r * 255.0f;
+	uint faultIndex00 = surfaceData00.g * POW_2_32;
+	uint foldIndex00 = surfaceData00.b * POW_2_32;
+
+	float4 surfaceData01 = GeologySurfaceRT[id.xy + int2(FaultLineWidth, 0)];
+	uint faultIndex01 = surfaceData01.g * POW_2_32;
+	uint foldIndex01 = surfaceData01.b * POW_2_32;
+
+	float4 surfaceData10 = GeologySurfaceRT[id.xy + int2(0, FaultLineWidth)];
+	uint faultIndex10 = surfaceData10.g * POW_2_32;
+	uint foldIndex10 = surfaceData10.b * POW_2_32;
+
+	float4 surfaceData11 = GeologySurfaceRT[id.xy + int2(FaultLineWidth, FaultLineWidth)];
+	uint faultIndex11 = surfaceData11.g * POW_2_32;
+	uint foldIndex11 = surfaceData11.b * POW_2_32;
+
+	uint minFaultIndex = min(min(faultIndex00, faultIndex01), min(faultIndex10, faultIndex11));
+	uint maxFaultIndex = max(max(faultIndex00, faultIndex01), max(faultIndex10, faultIndex11));
+
+	uint minFoldIndex = min(min(foldIndex00, foldIndex01), min(foldIndex10, foldIndex11));
+	uint maxFoldIndex = max(max(foldIndex00, foldIndex01), max(foldIndex10, foldIndex11));
+
+	if (minFaultIndex != maxFaultIndex) {
+		uint faultColourIndex = TotalFaults - firstbithigh(maxFaultIndex ^ minFaultIndex) - 1;
+		ColouredOutputRT[id.xy] = float4(FaultColourBuffer[faultColourIndex].rgb, 1);
+	} else {
+		int foldLine = 0;
+		for (uint i = 0; i < TotalFolds; i++) {
+			uint foldColourIndex = (TotalFolds - 1) * 2 - i * 2;
+
+			uint maxIndexMod = (maxFoldIndex >> i * 4) % 16;
+			uint minIndexMod = (minFoldIndex >> i * 4) % 16;
+
+			if (maxIndexMod == 8 && minIndexMod == 4) {
+				ColouredOutputRT[id.xy] = float4(FoldColourBuffer[foldColourIndex].rgb, 1);
+				foldLine = FoldColourBuffer[foldColourIndex].a > 0 ? 1 : 0;
+			} else if (maxIndexMod == 2 && minIndexMod == 1) {
+				ColouredOutputRT[id.xy] = float4(FoldColourBuffer[foldColourIndex + 1].rgb, 1);
+				foldLine = FoldColourBuffer[foldColourIndex + 1].a > 0 ? 1 : 0;
+			} 
+		}
+		if (foldLine == 0)
+		{
+			GeologicalLayer layerInfo = LayerBuffer[surfaceIndex];
+			float offset = surfaceIndex % 2 == 1 ? 0.5 : 0;
+			float4 texCol = PatternsTex2DArr.SampleLevel(samplerPatternsTex2DArr, float3(id.x / 40.0 + offset, id.y / 40.0 + offset, layerInfo.textureType), 0);
+			ColouredOutputRT[id.xy] = texCol * float4(layerInfo.colour, 1);
+		}
+	}
+}
+
+
+// Fill Rendertexture compute shader
+// Inputs
+float FillValue;
+
+// Outputs
+RWTexture2D<float> BufferRT;
+
+// Shader
+[numthreads(16,16,1)]
+void CS_FillRT (uint3 id : SV_DispatchThreadID)
+{
+	BufferRT[id.xy] = FillValue;
+}

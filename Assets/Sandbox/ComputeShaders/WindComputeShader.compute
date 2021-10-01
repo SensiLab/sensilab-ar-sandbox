@@ -1,0 +1,163 @@
+﻿//  
+//  This file is part of sensilab-ar-sandbox.
+//
+//  sensilab-ar-sandbox is free software: you can redistribute it and/or modify
+//  it under the terms of the GNU General Public License as published by
+//  the Free Software Foundation, either version 3 of the License, or
+//  (at your option) any later version.
+// 
+//  sensilab-ar-sandbox is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//  GNU General Public License for more details.
+// 
+//  You should have received a copy of the GNU General Public License
+//  along with sensilab-ar-sandbox.  If not, see <https://www.gnu.org/licenses/>.
+//
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CS_InitialiseParticles
+#pragma kernel CS_AddPollutant
+#pragma kernel CS_StepParticles
+
+#include "ComputeShaderHelpers.cginc"
+
+#define pi 3.141592653
+#define POW_2_16 65535.0
+
+struct ParticleData {
+	float2 Position;
+	float2 Velocity;
+	int Age;
+	int StartingAge;
+	int AlternateColour;
+};
+
+float4 SimulationBounds;
+float RandomSeed;
+RWStructuredBuffer<ParticleData> ParticleBuffer;
+
+[numthreads(64,1,1)]
+void CS_InitialiseParticles (uint3 id : SV_DispatchThreadID)
+{
+	uint index = id.x;
+	int posIndex = (int)index;
+	
+	float2 boundsCentrePoint = (SimulationBounds.xy + SimulationBounds.zw) / 2.0;
+	float2 boundsHalfSize = (SimulationBounds.zw - SimulationBounds.xy) / 2.0;
+
+	float xPos = boundsCentrePoint.x + boundsHalfSize.x * snoise(float2(posIndex + RandomSeed, 0)) / 0.707;
+	float yPos = boundsCentrePoint.y + boundsHalfSize.y * snoise(float2(posIndex + RandomSeed, 100)) / 0.707;
+	int randomAge = 10 + (int)(1 + snoise(float2(posIndex + RandomSeed, RandomSeed - 2.0 * posIndex)) / 0.707 / 2.0 * 200.0);
+
+	ParticleData particleData;
+	particleData.Position = float2(xPos, yPos);
+	particleData.Velocity = float2(0, 0);
+	particleData.Age = randomAge;
+	particleData.StartingAge = randomAge;
+	particleData.AlternateColour = 0;
+
+	ParticleBuffer[index] = particleData;
+}
+
+float3 PollutantPoint;
+[numthreads(64,1,1)]
+void CS_AddPollutant (uint3 id : SV_DispatchThreadID)
+{
+	uint index = id.x;
+	int posIndex = (int)index;
+
+	ParticleData particleData = ParticleBuffer[index];
+
+	float2 particlePosDelta = particleData.Position - PollutantPoint.xy;
+	float posDeltaMagnitude = sqrt(particlePosDelta.x * particlePosDelta.x + particlePosDelta.y * particlePosDelta.y);
+	if (posDeltaMagnitude < PollutantPoint.z) {
+		int randomAge = 600 + (int)(1 + snoise(float2(posIndex * 10 + RandomSeed, 0)) / 0.707 / 2.0 * 300.0);
+		particleData.Age = randomAge - 10;
+		particleData.StartingAge = randomAge;
+		particleData.AlternateColour = 1;
+	} 
+
+	ParticleBuffer[index] = particleData;
+}
+
+
+float WindSpeedMultiplier;
+int NorthernHemisphere;
+int CoriolisEffectEnabled;
+
+Texture2D<float> SandboxDepthsRT;
+// This sampler actually works!
+SamplerState linearClampSampler;
+
+[numthreads(64,1,1)]
+void CS_StepParticles (uint3 id : SV_DispatchThreadID)
+{
+	uint index = id.x;
+
+	int posIndex = (int)index;
+	ParticleData particleData = ParticleBuffer[index];
+
+	float2 particlePosShifted = particleData.Position - SimulationBounds.xy;
+	float2 boundsSize = (SimulationBounds.zw - SimulationBounds.xy);	
+	float2 particlePosNormalised = float2(particlePosShifted.x / boundsSize.x, particlePosShifted.y / boundsSize.y);
+	
+	float sampleStep = 0.005f;
+	float depth00 = (float)SandboxDepthsRT.SampleLevel(linearClampSampler, particlePosNormalised + float2(-sampleStep, -sampleStep), 0) * POW_2_16;
+	float depth01 = (float)SandboxDepthsRT.SampleLevel(linearClampSampler, particlePosNormalised + float2(-sampleStep, 0)		   , 0) * POW_2_16;
+	float depth02 = (float)SandboxDepthsRT.SampleLevel(linearClampSampler, particlePosNormalised + float2(-sampleStep, sampleStep) , 0) * POW_2_16;
+	float depth10 = (float)SandboxDepthsRT.SampleLevel(linearClampSampler, particlePosNormalised + float2(0, -sampleStep)		   , 0) * POW_2_16;
+	float depth12 = (float)SandboxDepthsRT.SampleLevel(linearClampSampler, particlePosNormalised + float2(0, sampleStep)		   , 0) * POW_2_16;
+	float depth20 = (float)SandboxDepthsRT.SampleLevel(linearClampSampler, particlePosNormalised + float2(sampleStep, -sampleStep) , 0) * POW_2_16;
+	float depth21 = (float)SandboxDepthsRT.SampleLevel(linearClampSampler, particlePosNormalised + float2(sampleStep, 0)		   , 0) * POW_2_16;
+	float depth22 = (float)SandboxDepthsRT.SampleLevel(linearClampSampler, particlePosNormalised + float2(sampleStep, sampleStep)  , 0) * POW_2_16;
+
+	float sobelHorizontal = depth00 + 2 * depth01 + depth02
+						  - depth20 - 2 * depth21 - depth22;
+
+	float sobelVertical = depth00 + 2 * depth10 + depth20
+						- depth02 - 2 * depth12 - depth22;
+	
+	float CoriolisEffect = CoriolisEffectEnabled ? pi / 8.0 : 0;
+	float gradientOffset = pi / 2.0 + CoriolisEffect;
+	gradientOffset = NorthernHemisphere ? gradientOffset : -gradientOffset;
+	float gradientAngle = atan2(sobelVertical, sobelHorizontal) + gradientOffset;
+
+	float gradientMagnitude = sqrt(sobelHorizontal*sobelHorizontal + sobelVertical*sobelVertical);
+	particleData.Velocity.x = WindSpeedMultiplier * 0.005 * cos(gradientAngle) * gradientMagnitude;
+	particleData.Velocity.y = WindSpeedMultiplier * 0.005 * sin(gradientAngle) * gradientMagnitude;
+
+	float2 boundsCentrePoint = (SimulationBounds.xy + SimulationBounds.zw) / 2.0;
+	float2 boundsHalfSize = (SimulationBounds.zw - SimulationBounds.xy) / 2.0;
+
+	float randomXPos = boundsCentrePoint.x + boundsHalfSize.x * snoise(float2(posIndex + RandomSeed, 0)) / 0.707;
+	float randomYPos = boundsCentrePoint.y + boundsHalfSize.y * snoise(float2(posIndex + RandomSeed, 100)) / 0.707;	
+	float2 randomPos = float2(randomXPos, randomYPos);
+	
+	particleData.Position += particleData.Velocity;
+	float2 randomPosition = float2(randomPos.x, randomPos.y);
+	particleData.Age -= 1;
+	
+	if (particleData.AlternateColour == 1 && gradientMagnitude < 5) {
+		particleData.Age -= 3;
+	} 
+	//float randomChance =  (1 + snoise(float2(posIndex + RandomSeed, 0)) / 0.707) / 2.0;
+	if (particleData.Age <= 0) {
+		int randomAge = 10 + (int)(1 + snoise(float2(posIndex * 10 + RandomSeed, 0)) / 0.707 / 2.0 * 200.0);
+
+		particleData.Age = randomAge;
+		particleData.StartingAge = randomAge;
+		particleData.Position = randomPosition;
+		particleData.Velocity = float2(0, 0);
+		particleData.AlternateColour = 0;
+	}
+
+	if (particleData.Position.x < SimulationBounds.x || particleData.Position.x > SimulationBounds.z ||
+								particleData.Position.y < SimulationBounds.y || particleData.Position.y > SimulationBounds.w) {		
+		particleData.Position = randomPosition;
+		particleData.Velocity = float2(0, 0);
+		particleData.AlternateColour = 0;
+	}
+	
+	ParticleBuffer[index] = particleData;
+}

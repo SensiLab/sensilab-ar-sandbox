@@ -1,0 +1,387 @@
+﻿#pragma kernel CS_GenerateLandscape
+#pragma kernel CS_StartFire
+#pragma kernel CS_StepFireSimulation
+#pragma kernel CS_RasteriseFireSimulation
+#pragma kernel CS_ResetLandscape
+
+// Simplex noise 2D - Converted to HLSL from the following repo:
+// https://github.com/ashima/webgl-noise/blob/master/src/noise2D.glsl
+// Description : Array and textureless GLSL 2D simplex noise function.
+//      Author : Ian McEwan, Ashima Arts.
+//  Maintainer : stegu
+//     Lastmod : 20110822 (ijm)
+//     License : Copyright (C) 2011 Ashima Arts. All rights reserved.
+//               Distributed under the MIT License. See LICENSE file.
+//               https://github.com/ashima/webgl-noise
+//               https://github.com/stegu/webgl-noise
+// 
+
+float3 mod289(float3 x) {
+	return x - floor(x * (1.0 / 289.0)) * 289.0;
+}
+
+float2 mod289(float2 x) {
+	return x - floor(x * (1.0 / 289.0)) * 289.0;
+}
+
+float3 permute(float3 x) {
+	return mod289(((x*34.0)+1.0)*x);
+}
+
+float snoise(float2 v)
+{
+	const float4 C = float4(0.211324865405187,  // (3.0-sqrt(3.0))/6.0
+						0.366025403784439,  // 0.5*(sqrt(3.0)-1.0)
+						-0.577350269189626,  // -1.0 + 2.0 * C.x
+						0.024390243902439); // 1.0 / 41.0
+	// First corner
+	float2 i  = floor(v + dot(v, C.yy) );
+	float2 x0 = v -   i + dot(i, C.xx);
+
+	// Other corners
+	float2 i1;
+	//i1.x = step( x0.y, x0.x ); // x0.x > x0.y ? 1.0 : 0.0
+	//i1.y = 1.0 - i1.x;
+	i1 = (x0.x > x0.y) ? float2(1.0, 0.0) : float2(0.0, 1.0);
+	// x0 = x0 - 0.0 + 0.0 * C.xx ;
+	// x1 = x0 - i1 + 1.0 * C.xx ;
+	// x2 = x0 - 1.0 + 2.0 * C.xx ;
+	float4 x12 = x0.xyxy + C.xxzz;
+	x12.xy -= i1;
+
+	// Permutations
+	i = mod289(i); // Avoid truncation effects in permutation
+	float3 p = permute( permute( i.y + float3(0.0, i1.y, 1.0 ))
+		+ i.x + float3(0.0, i1.x, 1.0 ));
+
+	float3 m = max(0.5 - float3(dot(x0,x0), dot(x12.xy,x12.xy), dot(x12.zw,x12.zw)), 0.0);
+	m = m*m ;
+	m = m*m ;
+
+	// Gradients: 41 points uniformly over a line, mapped onto a diamond.
+	// The ring size 17*17 = 289 is close to a multiple of 41 (41*7 = 287)
+
+	float3 x = 2.0 * frac(p * C.www) - 1.0;
+	float3 h = abs(x) - 0.5;
+	float3 ox = floor(x + 0.5);
+	float3 a0 = x - ox;
+
+	// Normalise gradients implicitly by scaling m
+	// Approximation of: m *= inversesqrt( a0*a0 + h*h );
+	m *= 1.79284291400159 - 0.85373472095314 * ( a0*a0 + h*h );
+
+	// Compute final noise value at P
+	float3 g;
+	g.x  = a0.x  * x0.x  + h.x  * x0.y;
+	g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+	return 130.0 * dot(m, g);
+}
+
+#define POW_2_16 65535.0
+
+// Shared Structs.
+// Structs
+struct FireCellMaterial {
+	float BurnRate;
+	float BurnoutTime;
+	float4 Colour;
+	float4 BurntColour;
+};
+
+// Shared inputs.
+uint2 FireLandscapeSize;
+StructuredBuffer<FireCellMaterial> FireCellMaterialsBuffer;
+uint TotalFireCellMaterials;
+
+// Shared outputs.
+RWTexture2D<float4> FireLandscapeRT;
+
+// Rasterise Fire Simulation compute shader
+// Inputs
+// FireCellMaterialsBuffer (Shared)
+// FireLandscapeRT (Shared)
+
+// Outputs
+RWTexture2D<float4> FireRasterisedRT;
+
+[numthreads(16,16,1)]
+void CS_RasteriseFireSimulation (uint3 id : SV_DispatchThreadID)
+{
+	float4 fireCell = FireLandscapeRT[id.xy];
+	uint materialIndex = fireCell.g * 255.0;
+	materialIndex = materialIndex < TotalFireCellMaterials ? materialIndex : 0;
+	FireCellMaterial fireCellMat = FireCellMaterialsBuffer[materialIndex];
+
+	if (fireCell.a <= 0) {
+		FireRasterisedRT[id.xy] = fireCellMat.BurntColour;
+	}
+	else if (fireCell.r > 0.8) {
+		FireRasterisedRT[id.xy] = float4 (fireCell.r, 0.2, 0, 1);
+		}
+	 else if (fireCell.r > 0) {
+		FireRasterisedRT[id.xy] = float4 (0.5f + fireCell.r / 0.1, 0.5f + fireCell.r / 0.1, 0, 1);
+	} else {
+		FireRasterisedRT[id.xy] = fireCellMat.Colour;
+	}
+}
+
+// Step Fire Simulation compute shader
+// Inputs
+// FireCellMaterialsBuffer (Shared)
+Texture2D SandboxDepthsRT;
+SamplerState samplerSandboxDepthsRT
+{
+    Filter = MIN_MAG_MIP_POINT;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+RWTexture2D<float4> PrevStepRT;
+
+float4 WindCoefficients0;
+#define Wind_N		(WindCoefficients0.x)
+#define Wind_E		(WindCoefficients0.y)
+#define Wind_S		(WindCoefficients0.z)
+#define Wind_W		(WindCoefficients0.w)
+
+float4 WindCoefficients1;
+#define Wind_NE		(WindCoefficients1.x)
+#define Wind_SE		(WindCoefficients1.y)
+#define Wind_SW		(WindCoefficients1.z)
+#define Wind_NW		(WindCoefficients1.w)
+
+float SizeFactor;
+
+// Outputs
+// FireLandscapeRT
+
+// Temporary smoothing functions
+float BellFunc(float x)
+	{
+		float f = (x / 2.0) * 1.5; // Converting -2 to +2 to -1.5 to +1.5
+		if (f > -1.5 && f < -0.5)
+		{
+			return(0.5 * pow(f + 1.5, 2.0));
+		}
+		else if (f > -0.5 && f < 0.5)
+		{
+			return 3.0 / 4.0 - (f * f);
+		}
+		else if ((f > 0.5 && f < 1.5))
+		{
+			return(0.5 * pow(f - 1.5, 2.0));
+		}
+		return 0.0;
+	}
+
+float BiCubic(float2 uv)
+{
+	float2 uvStep = float2(1.0 / FireLandscapeSize.x, 1.0 / FireLandscapeSize.y	);
+	float sum = 0.0;
+	float denom = 0.0;
+	float a = frac(uv.x * FireLandscapeSize.x);
+	float b = frac(uv.y * FireLandscapeSize.y);
+
+	float2 texUV = uv - float2(a / FireLandscapeSize.x, b / FireLandscapeSize.y	) + float2(0.0001, 0.0001);
+	for (int m = -1; m <= 2; m++)
+	{
+		for (int n = -1; n <= 2; n++)
+		{
+			float2 uvOffset = float2(uvStep.x * float(m), uvStep.y * float(n));
+			float heightVal = (float)SandboxDepthsRT.SampleLevel(samplerSandboxDepthsRT, texUV + uvOffset, 0);
+
+			float f = BellFunc(float(m) - a);
+			float f1 = BellFunc(-(float(n) - b));
+
+			sum = sum + (heightVal * f * f1);
+			denom = denom + (f * f1);
+		}
+	}
+	return sum / denom;
+}
+
+float CalculateHeightInfluence(float heightDifference) {
+	float scaledHeightDifference = heightDifference * POW_2_16;
+	if (scaledHeightDifference < 0) {
+		// Uphill
+		return 1 - scaledHeightDifference * 1.65;
+	} else {
+		// Downhill
+		return clamp(1 - scaledHeightDifference * 1.35, 0, 1);
+	}
+}
+
+[numthreads(16,16,1)]
+void CS_StepFireSimulation (uint3 id : SV_DispatchThreadID)
+{
+	int x = (int)id.x;
+	int y = (int)id.y;
+	int2 cellPos = int2(x, y);
+	float4 fireCell = PrevStepRT[cellPos];
+
+	float sizeX = float(FireLandscapeSize.x);
+	float sizeY = float(FireLandscapeSize.y);
+	float2 texDelta = float2(1 / sizeX, 1 / sizeY);
+	float2 texCoord = float2(id.x / sizeX, id.y / sizeY);
+
+	float terrainDepth = BiCubic(texCoord);
+
+	// Direct Neighbours
+	// fireCell_North
+	float4 fC_N = PrevStepRT[cellPos + int2( 0, -1)];
+	float cellBurnProportion_N = fC_N.a < 0.8 ? 0 : (float)fC_N.r;
+	// terrainDepth_North
+	float tD_N = BiCubic(texCoord + float2(0, -texDelta.y));
+	// heightInfluence_North
+	float hI_N = CalculateHeightInfluence(terrainDepth - tD_N);
+	// finalValue_North
+	float fV_N = cellBurnProportion_N * Wind_N * hI_N * SizeFactor;
+
+	float4 fC_E = PrevStepRT[cellPos + int2( 1,  0)];
+	float cellBurnProportion_E = fC_E.a < 0.8 ? 0 : (float)fC_E.r;
+	float tD_E = BiCubic(texCoord + float2(texDelta.x, 0));
+	float hI_E = CalculateHeightInfluence(terrainDepth - tD_E);
+	float fV_E = cellBurnProportion_E * Wind_E * hI_E * SizeFactor;
+
+	float4 fC_S = PrevStepRT[cellPos + int2( 0,  1)];
+	float cellBurnProportion_S = fC_S.a < 0.8 ? 0 : (float)fC_S.r;
+	float tD_S = BiCubic(texCoord + float2(0, texDelta.y));
+	float hI_S = CalculateHeightInfluence(terrainDepth - tD_S);
+	float fV_S = cellBurnProportion_S * Wind_S * hI_S * SizeFactor;
+
+	float4 fC_W = PrevStepRT[cellPos + int2(-1,  0)];
+	float cellBurnProportion_W = fC_W.a < 0.8 ? 0 : (float)fC_W.r;
+	float tD_W = BiCubic(texCoord + float2(-texDelta.x, 0));
+	float hI_W = CalculateHeightInfluence(terrainDepth - tD_W);
+	float fV_W = cellBurnProportion_W * Wind_W * hI_W * SizeFactor;
+
+	// Indirect Neighbours
+	float4 fC_NE = PrevStepRT[cellPos + int2( 1, -1)];
+	float cellBurnProportion_NE = fC_NE.a < 0.95 ? 0 : (float)fC_NE.r;
+	float tD_NE = BiCubic(texCoord + float2(texDelta.x, -texDelta.y));
+	float hI_NE = CalculateHeightInfluence(terrainDepth - tD_NE);
+	float fV_NE = cellBurnProportion_NE * Wind_NE * hI_NE * SizeFactor;
+
+	float4 fC_NW = PrevStepRT[cellPos + int2(-1, -1)];
+	float cellBurnProportion_NW = fC_NW.a < 0.95 ? 0 : (float)fC_NW.r;
+	float tD_NW = BiCubic(texCoord + float2(-texDelta.x, -texDelta.y));
+	float hI_NW = CalculateHeightInfluence(terrainDepth - tD_NW);
+	float fV_NW = cellBurnProportion_NW * Wind_NW * hI_NW * SizeFactor;
+
+	float4 fC_SE = PrevStepRT[cellPos + int2( 1,  1)];
+	float cellBurnProportion_SE = fC_SE.a < 0.95 ? 0 : (float)fC_SE.r;
+	float tD_SE = BiCubic(texCoord + float2(texDelta.x, texDelta.y));
+	float hI_SE = CalculateHeightInfluence(terrainDepth - tD_SE);
+	float fV_SE = cellBurnProportion_SE * Wind_SE * hI_SE * SizeFactor;
+
+	float4 fC_SW = PrevStepRT[cellPos + int2(-1,  1)];
+	float cellBurnProportion_SW = fC_SW.a < 0.95 ? 0 : (float)fC_SW.r;
+	float tD_SW = BiCubic(texCoord + float2(-texDelta.x, texDelta.y));
+	float hI_SW = CalculateHeightInfluence(terrainDepth - tD_SW);
+	float fV_SW = cellBurnProportion_SW * Wind_SW * hI_SW * SizeFactor;
+
+	uint materialIndex = fireCell.g * 255.0;
+	materialIndex = materialIndex < TotalFireCellMaterials ? materialIndex : 0;
+	FireCellMaterial fireCellMat = FireCellMaterialsBuffer[materialIndex];
+
+	float burnRate = fireCellMat.BurnRate + fireCell.b;
+	burnRate = clamp(burnRate, 0.01, 1000);
+
+	float closeNeighbours = (fV_N + fV_E + fV_S + fV_W) / 4.0 * burnRate;
+	float farNeighbours = (fV_NE + fV_NW + fV_SE + fV_SW) / 4.0 * burnRate;
+	float fireValue = fireCell.r * 1.1 + closeNeighbours + 0.83 * farNeighbours;
+	fireValue = clamp(fireValue, 0.0, 1.0);
+
+	if (fireValue < 0.0001) fireValue = 0;
+	fireCell.r = fireValue;
+
+	if (fireValue >= 1) {
+		float currentBurnout = fireCell.a;
+		currentBurnout -= 1.0f / fireCellMat.BurnoutTime;
+		fireCell.a = currentBurnout;
+	}
+	if (fireCell.a <= 0) {
+		fireCell.r = 0;
+	}
+	FireLandscapeRT[cellPos] = fireCell;
+}
+
+// Start Fire compute shader
+// Structs
+struct FireStartPoint {
+	int2 Position;
+	int Radius;
+};
+
+// Inputs
+StructuredBuffer<FireStartPoint> FireStartPointBuffer;
+int TotalFireStartPoints;
+
+// Outputs
+// FireLandscapeRT
+[numthreads(16,16,1)]
+void CS_StartFire (uint3 id : SV_DispatchThreadID)
+{
+	float4 fireCell = FireLandscapeRT[id.xy];
+
+	for (int i = 0; i < TotalFireStartPoints; i++) {
+		FireStartPoint firePoint = FireStartPointBuffer[i];
+		float xDelta = firePoint.Position.x - (int)id.x;
+		float yDelta = firePoint.Position.y - (int)id.y;
+		float dist = sqrt(xDelta*xDelta + yDelta*yDelta);
+		if (dist <= firePoint.Radius) {
+			float burningValue = 1;
+			FireLandscapeRT[id.xy] = float4(burningValue, fireCell.g, 0, 1.0);
+		}
+	}
+}
+
+// Fill Rendertexture compute shader
+// Inputs
+float RandomSeedOffset;
+float LandscapeZoom;
+
+// Outputs
+// FireLandscapeRT
+
+// Shader
+[numthreads(16,16,1)]
+void CS_GenerateLandscape (uint3 id : SV_DispatchThreadID)
+{
+	float xIndex = (int)id.x - (int)FireLandscapeSize.x / 2.0;
+	float yIndex = (int)id.y - (int)FireLandscapeSize.y / 2.0;
+
+	float2 noiseCoordSmall = float2(xIndex / 400.0 * LandscapeZoom  + RandomSeedOffset, yIndex / 400.0 * LandscapeZoom + RandomSeedOffset);
+	float noiseSmall = snoise(noiseCoordSmall);
+	float2 noiseCoordMedium = float2(xIndex / 200.0 * LandscapeZoom + RandomSeedOffset, yIndex / 200.0 * LandscapeZoom + RandomSeedOffset);
+	float noiseMedium = snoise(noiseCoordMedium);
+	float2 noiseCoordLarge = float2(xIndex / 100.0 * LandscapeZoom + RandomSeedOffset, yIndex / 100.0 * LandscapeZoom + RandomSeedOffset);
+	float noiseLarge = snoise(noiseCoordLarge);
+	float2 noiseCoordVLarge = float2(xIndex / 10.0 * LandscapeZoom + RandomSeedOffset, yIndex / 10.0 * LandscapeZoom + RandomSeedOffset);
+	float noiseVLarge = snoise(noiseCoordVLarge);
+
+	float simplexNoise = (noiseSmall * 0.7 + noiseMedium * 0.2 + noiseLarge * 0.1) * 1;
+	simplexNoise = (1 + simplexNoise) / 2.0;
+	noiseMedium = (1 + noiseMedium) / 2.0;
+
+	int materialIndex;
+	materialIndex = 3 - floor(simplexNoise * 4);
+	
+	FireLandscapeRT[id.xy] = float4(0, materialIndex / 255.0, -0.05 + noiseVLarge * 0.1, 1);
+}
+
+// Reset Landscape compute shader
+// Inputs
+// FireLandscapeRT
+
+// Outputs
+// FireLandscapeRT
+
+// Shader
+[numthreads(16,16,1)]
+void CS_ResetLandscape (uint3 id : SV_DispatchThreadID)
+{
+	float4 fireCell = FireLandscapeRT[id.xy];
+	
+	FireLandscapeRT[id.xy] = float4(0, fireCell.g, fireCell.b, 1);
+}
