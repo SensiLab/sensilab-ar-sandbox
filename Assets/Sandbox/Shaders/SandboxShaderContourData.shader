@@ -1,4 +1,8 @@
 ﻿//  
+//  SandboxShaderContourData.shader
+//
+//	Copyright 2021 SensiLab, Monash University <sensilab@monash.edu>
+//
 //  This file is part of sensilab-ar-sandbox.
 //
 //  sensilab-ar-sandbox is free software: you can redistribute it and/or modify

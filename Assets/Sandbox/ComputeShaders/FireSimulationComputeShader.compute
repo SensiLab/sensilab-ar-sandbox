@@ -1,20 +1,29 @@
-﻿#pragma kernel CS_GenerateLandscape
+﻿//  
+//  FireSimulationComputeShader.compute
+//
+//	Copyright 2021 SensiLab, Monash University <sensilab@monash.edu>
+//
+//  This file is part of sensilab-ar-sandbox.
+//
+//  sensilab-ar-sandbox is free software: you can redistribute it and/or modify
+//  it under the terms of the GNU General Public License as published by
+//  the Free Software Foundation, either version 3 of the License, or
+//  (at your option) any later version.
+// 
+//  sensilab-ar-sandbox is distributed in the hope that it will be useful,
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//  GNU General Public License for more details.
+// 
+//  You should have received a copy of the GNU General Public License
+//  along with sensilab-ar-sandbox.  If not, see <https://www.gnu.org/licenses/>.
+//
+
+#pragma kernel CS_GenerateLandscape
 #pragma kernel CS_StartFire
 #pragma kernel CS_StepFireSimulation
 #pragma kernel CS_RasteriseFireSimulation
 #pragma kernel CS_ResetLandscape
-
-// Simplex noise 2D - Converted to HLSL from the following repo:
-// https://github.com/ashima/webgl-noise/blob/master/src/noise2D.glsl
-// Description : Array and textureless GLSL 2D simplex noise function.
-//      Author : Ian McEwan, Ashima Arts.
-//  Maintainer : stegu
-//     Lastmod : 20110822 (ijm)
-//     License : Copyright (C) 2011 Ashima Arts. All rights reserved.
-//               Distributed under the MIT License. See LICENSE file.
-//               https://github.com/ashima/webgl-noise
-//               https://github.com/stegu/webgl-noise
-// 
 
 float3 mod289(float3 x) {
 	return x - floor(x * (1.0 / 289.0)) * 289.0;
