@@ -10,6 +10,7 @@ Updates include:
 * Fire simulations
 * Wind simulations
 * Complex Geology simulations
+* Ability to save, recall and export topologies
 * Various configuration options
 * Support for a secondary touch screen
 
